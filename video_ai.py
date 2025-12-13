@@ -170,6 +170,7 @@ class GenerativeAI:
         self.load_model()
         
         cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
         frame_id = 0
         
         # Adaptive sampling state
@@ -235,8 +236,10 @@ class GenerativeAI:
             )[0]
 
             # Result Construction
+            timestamp = frame_id / fps if fps > 0 else 0
             result = {
                 "frame_id": frame_id,
+                "timestamp": timestamp,
                 "raw_text": output_text
             }
 
