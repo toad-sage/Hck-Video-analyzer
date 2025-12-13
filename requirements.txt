@@ -8,6 +8,7 @@ sentence-transformers>=2.3.0
 accelerate>=0.30.0
 torch>=2.0.0
 torchvision>=0.15.0
+autoawq>=0.1.8
 
 # Web framework
 fastapi>=0.110.0
@@ -21,8 +22,8 @@ boto3>=1.34.0
 Pillow>=10.0.0
 
 # Optional: Audio processing (uncomment if needed)
-# moviepy>=1.0.3
-# openai-whisper>=20231117
+moviepy>=1.0.3
+openai-whisper>=20231117
 
 # Constraints
 numpy<2.0

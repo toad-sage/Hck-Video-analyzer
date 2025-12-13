@@ -1,12 +1,20 @@
+import os
+# Set threading environment variables for better performance BEFORE importing torch
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 from sentence_transformers import SentenceTransformer
 import cv2
-import os
 from PIL import Image
 import json
 import re
+
+
+TIMEFRAME_FOR_AUDIO_CONTEXT = 2
 
 QWEN_F1_STRATEGY_PROMPT = (
     "You are an expert Formula 1 race strategist and data analyst.\n\n"
@@ -14,8 +22,11 @@ QWEN_F1_STRATEGY_PROMPT = (
     "- \"give me the timestamp when Norris went for tyre change in the pit\"\n"
     "- \"how many times was McLaren ahead of Ferrari?\"\n"
     "- \"who finished on the podium and how did their strategies differ?\"\n\n"
-    "From ONLY this ONE frame of the race video, infer as much as you reasonably can about the race "
-    "situation, strategy, pit lane activity and podium context, and output a single JSON object "
+    "From ONLY this ONE frame of the race video and the audio context, infer as much as you reasonably can about the race "
+    "situation, strategy, pit lane activity and podium context, and output a single JSON object. "
+    " Note that in the single frame, you may see the lcurrent ranking on the left side of the screen, or laps will be shown as well"
+    "You can also use the audio context to infer the current lap number and the current lap number. BUT a lot of times this information will not be available in the audio context."
+    "Therefore, you should not hullucinate the current lap number and the current lap time and current standings of the drivers"
     "with the following structure:\n\n"
     "{\n"
     "  \"frame_summary\": {\n"
@@ -82,7 +93,7 @@ QWEN_F1_STRATEGY_PROMPT = (
     "  }\n"
     "}\n\n"
     "STRICT RULES:\n"
-    "- Output ONLY valid JSON, no markdown, no comments, no extra text.\n"
+    "- Output ONLY valid JSON, no markdown, no comments, no extra text. No comments like \"Your JSON object is now complete and accurate based on the provided frame and audio context. If you have any more questions or need further assistance, feel free to ask!\" or any other comments like that.\n"
     "- If something is not visible or cannot be inferred from THIS ONE IMAGE, set it to null or an empty array. "
     "Do NOT hallucinate precise details like exact lap numbers or timestamps that are not visible.\n"
     "- Prefer conservative guesses with low/medium confidence rather than making up unsupported facts.\n"
@@ -101,6 +112,59 @@ QWEN_F1_STRATEGY_PROMPT = (
     "such as a visible pit stop, podium ceremony, or safety car on track. Do NOT describe the whole race history.\n"
 )
 
+def _extract_json_only(output_text: str) -> str:
+    """
+    Extract only the FIRST complete JSON object from model output.
+    
+    Tracks brace nesting to find where the first JSON object ends,
+    ignoring any repeated JSONs or commentary that follows.
+    """
+    # Remove markdown fences if present
+    clean_text = re.sub(r'```json|```', '', output_text).strip()
+    
+    # Find the first opening brace
+    start = clean_text.find("{")
+    if start == -1:
+        return clean_text
+    
+    # Track brace nesting to find the matching closing brace
+    depth = 0
+    in_string = False
+    escape_next = False
+    
+    for i in range(start, len(clean_text)):
+        char = clean_text[i]
+        
+        if escape_next:
+            escape_next = False
+            continue
+            
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+            
+        if char == '"' and not escape_next:
+            in_string = not in_string
+            continue
+            
+        if in_string:
+            continue
+            
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                # Found the end of the first complete JSON object
+                return clean_text[start : i + 1]
+    
+    # Fallback: if we couldn't find matching braces, return from start to last }
+    end = clean_text.rfind("}")
+    if end > start:
+        return clean_text[start : end + 1]
+    return clean_text
+
+
 def _parse_qwen_json(output_text: str):
     """
     Best-effort parser for Qwen JSON outputs.
@@ -110,14 +174,8 @@ def _parse_qwen_json(output_text: str):
     - Attempts a strict json.loads
     - On failure, tries to fix common issues like trailing commas
     """
-    # Remove markdown fences if still present
-    clean_text = re.sub(r'```json|```', '', output_text).strip()
-
-    # Keep only the innermost JSON object if there is extra commentary
-    start = clean_text.find("{")
-    end = clean_text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        clean_text = clean_text[start : end + 1]
+    # Extract only the JSON portion
+    clean_text = _extract_json_only(output_text)
 
     # First attempt: raw
     try:
@@ -133,6 +191,8 @@ class GenerativeAI:
         self.model = None
         self.processor = None
         self.embedder = None
+        self.is_mlx = False
+        self.mlx_generate = None
         self.device = "cpu"
         if torch.backends.mps.is_available():
             self.device = "mps"
@@ -143,26 +203,47 @@ class GenerativeAI:
         if self.model:
             return
         
-        print(f"Loading Qwen2-VL on {self.device}...")
+        # Try MLX first (much faster on Apple Silicon)
+        try:
+            from mlx_vlm import load, generate
+            
+            print(f"Loading Qwen2.5-VL with MLX (optimized for Apple Silicon)...")
+            model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
+            self.model, self.processor = load(model_path, trust_remote_code=True)
+            self.is_mlx = True
+            self.mlx_generate = generate
+            
+            print("Loading CLIP...")
+            self.embedder = SentenceTransformer('clip-ViT-B-32', device="cpu")
+            print("MLX model loaded successfully!")
+            return
+        except ImportError as e:
+            print(f"MLX not available, falling back to PyTorch: {e}")
+        except Exception as e:
+            print(f"MLX load failed, falling back to PyTorch: {e}")
+        
+        # PyTorch Fallback
+        self.is_mlx = False
+        print(f"Loading Qwen2.5-VL on {self.device} (PyTorch)...")
         try:
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                "Qwen/Qwen2-VL-2B-Instruct",
-                torch_dtype=torch.float16 if self.device != "cpu" else torch.float32,
+                "Qwen/Qwen2.5-VL-3B-Instruct",
+                dtype=torch.float16 if self.device != "cpu" else torch.float32,
                 device_map="auto" if self.device != "mps" else None
             )
             if self.device == "mps":
                 self.model = self.model.to(self.device)
                 
-            self.processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
+            self.processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct", use_fast=True)
             
             print("Loading CLIP...")
-            self.embedder = SentenceTransformer('clip-ViT-B-32', device=self.device)
+            self.embedder = SentenceTransformer('clip-ViT-B-32', device="cpu")
             
         except Exception as e:
             print(f"GenAI Load Error: {e}")
             raise
 
-    def process_video_captioning(self, video_path, prompt=QWEN_F1_STRATEGY_PROMPT, json_mode=False):
+    def process_video_captioning(self, video_path, prompt=QWEN_F1_STRATEGY_PROMPT, json_mode=False, audio_segments=None):
         if not os.path.exists(video_path):
             yield {"error": f"File {video_path} not found"}
             return
@@ -172,6 +253,13 @@ class GenerativeAI:
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_id = 0
+        
+        # Sliding window pointers for O(n) total audio segment lookup
+        # seg_left: first segment that might still overlap (hasn't ended before our window)
+        # seg_right: first segment we haven't checked yet
+        seg_left = 0
+        seg_right = 0
+        num_segments = len(audio_segments) if audio_segments else 0
         
         # Adaptive sampling state
         prev_frame_gray = None
@@ -201,6 +289,42 @@ class GenerativeAI:
             prev_frame_gray = current_frame_gray
             last_processed_id = frame_id
 
+            # Calculate current timestamp
+            current_time = frame_id / fps if fps > 0 else 0
+
+            # 1. Contextual Audio Logic (sliding window - O(n) total)
+            frame_specific_prompt = prompt
+            audio_context = None
+            if audio_segments and num_segments > 0:
+                window_start = current_time - TIMEFRAME_FOR_AUDIO_CONTEXT
+                window_end = current_time + TIMEFRAME_FOR_AUDIO_CONTEXT
+                
+                # Advance seg_left: skip segments that have ended before window_start
+                while seg_left < num_segments and audio_segments[seg_left]['end'] <= window_start:
+                    seg_left += 1
+                
+                # Advance seg_right: include segments that start before window_end
+                while seg_right < num_segments and audio_segments[seg_right]['start'] < window_end:
+                    seg_right += 1
+                
+                # Collect text from segments in [seg_left, seg_right) that overlap
+                relevant_text = []
+                for i in range(seg_left, seg_right):
+                    seg = audio_segments[i]
+                    # Double-check overlap (seg might have ended before window_start)
+                    if seg['end'] > window_start and seg['start'] < window_end:
+                        relevant_text.append(seg['text'])
+
+                if relevant_text:
+                    audio_context = " ".join(relevant_text)
+                    print(f"Audio context: {audio_context}")
+                    # Append this context to the user's prompt
+                    frame_specific_prompt = (
+                        f"{prompt}\n\n"
+                        f"ADDITIONAL CONTEXT FROM AUDIO (spoken within +/- {TIMEFRAME_FOR_AUDIO_CONTEXT} seconds): \"{audio_context}\"\n"
+                        f"Use this audio context to better interpret what is happening in the visual frame."
+                    )
+
             # Inference
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(rgb_frame)
@@ -210,38 +334,83 @@ class GenerativeAI:
                     "role": "user",
                     "content": [
                         {"type": "image", "image": pil_image},
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": frame_specific_prompt},
                     ],
                 }
             ]
             
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-            inputs = inputs.to(self.device)
+            output_text = ""
+            
+            if self.is_mlx and self.mlx_generate:
+                # MLX Inference Path (faster on Apple Silicon)
+                # mlx_vlm.generate expects an image file path, so we save to a temp file
+                import tempfile
+                temp_img_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                        temp_img_path = tmp.name
+                        pil_image.save(tmp, format="JPEG", quality=85)
+                    
+                    # mlx_vlm.generate signature: (model, processor, prompt, image=..., max_tokens=...)
+                    # Returns a GenerationResult dataclass with .text attribute
+                    result = self.mlx_generate(
+                        self.model, 
+                        self.processor, 
+                        frame_specific_prompt,
+                        image=temp_img_path,
+                        max_tokens=2048,
+                        verbose=False
+                    )
+                    # Extract text from GenerationResult
+                    if hasattr(result, 'text'):
+                        output_text = result.text
+                    else:
+                        output_text = str(result)
+                except Exception as e:
+                    print(f"MLX Inference Error: {e}")
+                    yield {"error": f"MLX Inference Error: {e}"}
+                    frame_id += 1
+                    continue
+                finally:
+                    # Clean up temp file
+                    if temp_img_path and os.path.exists(temp_img_path):
+                        try:
+                            os.remove(temp_img_path)
+                        except:
+                            pass
+            else:
+                # PyTorch Inference Path
+                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                image_inputs, video_inputs = process_vision_info(messages)
+                inputs = self.processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                inputs = inputs.to(self.device)
 
-            # Allow more room so long JSON responses don't get cut too early
-            generated_ids = self.model.generate(**inputs, max_new_tokens=1024)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
+                # Allow more room so long JSON responses don't get cut too early
+                generated_ids = self.model.generate(**inputs, max_new_tokens=1024)
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                output_text = self.processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )[0]
 
             # Result Construction
             timestamp = frame_id / fps if fps > 0 else 0
+            # Clean the output text to remove any trailing commentary
+            cleaned_output = _extract_json_only(output_text) if json_mode else output_text
             result = {
                 "frame_id": frame_id,
                 "timestamp": timestamp,
-                "raw_text": output_text
+                "raw_text": cleaned_output
             }
+            if audio_context:
+                result["audio_context"] = audio_context
 
             if json_mode:
                 try:
@@ -277,4 +446,3 @@ class GenerativeAI:
             frame_id += 1
 
         cap.release()
-
