@@ -1,5 +1,5 @@
 from ultralytics import YOLO
-from video_ai import GenerativeAI
+from video_ai  import GenerativeAI
 from kv_writer import KVWriter
 import cv2
 import os

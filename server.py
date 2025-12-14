@@ -4,7 +4,7 @@ from typing import Optional
 from uuid import uuid4
 
 import boto3
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from video_ai import GenerativeAI, QWEN_F1_STRATEGY_PROMPT
@@ -19,11 +19,12 @@ kv_writer = KVWriter()
 
 
 class AnalyzeRequest(BaseModel):
-    aws_access_key_id: str
-    aws_secret_access_key: str
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
     region_name: str = "ap-south-1"
-    bucket: str
-    key: str  # S3 object key, e.g. "videos/myvideo.mp4"
+    bucket: Optional[str] = None
+    key: Optional[str] = None  # S3 object key, e.g. "videos/myvideo.mp4"
+    local_path: Optional[str] = None
     json_mode: bool = False
     prompt: Optional[str] = None
 
@@ -54,7 +55,7 @@ def _extract_audio_transcript(request_id: str, video_path: str) -> Optional[str]
     Uses moviepy to dump a WAV file and openai-whisper to transcribe it.
     """
     try:
-        from moviepy.editor import VideoFileClip  # type: ignore
+        from moviepy import VideoFileClip  # type: ignore
         import whisper  # type: ignore
     except ImportError as e:
         print(f"[{request_id}] Audio transcription disabled, missing dependency: {e}")
@@ -93,7 +94,7 @@ def _extract_audio_transcript(request_id: str, video_path: str) -> Optional[str]
         except Exception as cleanup_err:
             print(f"[{request_id}] Audio temp file cleanup error: {cleanup_err}")
 
-    return transcript
+    return result
 
 
 def _process_video_job(
@@ -102,6 +103,7 @@ def _process_video_job(
     video_name: str,
     json_mode: bool,
     prompt: Optional[str],
+    cleanup_file: bool = True,
 ):
     """
     Run multimodal analysis (audio + video) on the downloaded file
@@ -111,8 +113,16 @@ def _process_video_job(
         effective_prompt = prompt or QWEN_F1_STRATEGY_PROMPT
 
         # 1) Audio pipeline: extract + transcribe whole video once
-        transcript = _extract_audio_transcript(request_id, tmp_path)
-        if transcript:
+        transcript_result = _extract_audio_transcript(request_id, tmp_path)
+        print(f"[{request_id}] Transcript result: {transcript_result}")
+        full_transcript_text = None
+        audio_segments = []
+
+        if transcript_result:
+            full_transcript_text = transcript_result.get("text", "").strip()
+            audio_segments = transcript_result.get("segments", [])
+
+        if full_transcript_text:
             # Ensure embedder is ready so we can store a vector for the transcript too
             try:
                 gen_ai.load_model()
@@ -120,8 +130,8 @@ def _process_video_job(
                     "type": "audio_transcript",
                     "video_name": video_name,
                     "request_id": request_id,
-                    "transcript": transcript,
-                    "vector": gen_ai.embedder.encode(transcript).tolist()
+                    "transcript": full_transcript_text,
+                    "vector": gen_ai.embedder.encode(full_transcript_text).tolist()
                     if gen_ai.embedder
                     else None,
                 }
@@ -131,7 +141,7 @@ def _process_video_job(
                     "type": "audio_transcript",
                     "video_name": video_name,
                     "request_id": request_id,
-                    "transcript": transcript,
+                    "transcript": full_transcript_text,
                 }
 
             # Use a synthetic 'frame_id' key suffix for transcript
@@ -142,6 +152,7 @@ def _process_video_job(
             tmp_path,
             prompt=effective_prompt,
             json_mode=json_mode,
+            audio_segments=audio_segments
         ):
             # Defensive checks
             if not isinstance(res, dict):
@@ -173,6 +184,8 @@ def _process_video_job(
                     doc["vector"] = res["vector"]
                 # Optional: keep raw_text for debugging
                 doc["raw_text"] = res.get("raw_text")
+                doc["timestamp"] = res.get("timestamp")
+                doc["audio_context"] = res.get("audio_context")
             else:
                 # Caption mode or JSON parse failure: keep payload structure
                 doc = {
@@ -190,26 +203,42 @@ def _process_video_job(
     except Exception as e:
         print(f"[{request_id}] Video processing error for {video_name}: {e}")
     finally:
-        # Clean up local file
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception as cleanup_err:
-            print(f"[{request_id}] Temp file cleanup error: {cleanup_err}")
+        # Clean up local file if requested
+        if cleanup_file:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception as cleanup_err:
+                print(f"[{request_id}] Temp file cleanup error: {cleanup_err}")
 
 
 @app.post("/analyze")
 def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
     """
-    Kick off analysis of a video stored in S3.
-
-    - Downloads the video using provided S3 creds.
-    - Runs Qwen2-VL analysis in the background.
-    - Writes per-frame documents into Couchbase KV via KVWriter.
+    Kick off analysis of a video stored in S3 or locally.
     """
-    # Download immediately so the HTTP request can return once job is scheduled
-    tmp_path = _download_from_s3(request)
-    video_name = os.path.basename(request.key)
+    # Determine source
+    if request.local_path:
+        if not os.path.exists(request.local_path):
+            raise HTTPException(status_code=400, detail=f"Local file not found: {request.local_path}")
+        tmp_path = request.local_path
+        video_name = os.path.basename(tmp_path)
+        cleanup_file = False
+        s3_bucket = "local"
+        s3_key = request.local_path
+    else:
+        # S3 Mode - Validate S3 params
+        if not (request.aws_access_key_id and request.aws_secret_access_key and request.bucket and request.key):
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing S3 credentials. Provide 'local_path' OR ('aws_access_key_id', 'aws_secret_access_key', 'bucket', 'key')."
+            )
+        # Download immediately so the HTTP request can return once job is scheduled
+        tmp_path = _download_from_s3(request)
+        video_name = os.path.basename(request.key)
+        cleanup_file = True
+        s3_bucket = request.bucket
+        s3_key = request.key
 
     # Generate a request/job id for tracking
     request_id = str(uuid4())
@@ -221,14 +250,15 @@ def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
         video_name=video_name,
         json_mode=request.json_mode,
         prompt=request.prompt,
+        cleanup_file=cleanup_file,
     )
 
     return {
         "status": "ok",
         "requestId": request_id,
         "video_name": video_name,
-        "s3_bucket": request.bucket,
-        "s3_key": request.key,
+        "s3_bucket": s3_bucket,
+        "s3_key": s3_key,
     }
 
 

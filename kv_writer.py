@@ -8,9 +8,10 @@ import os
 class KVWriter:
     def __init__(self):
         # Use the known working configuration
-        self.host = "couchbase://127.0.0.1:10182"
+        # Updated to standard port 8091 since checking lsof showed it is running there
+        self.host = "couchbase://127.0.0.1" 
         self.user = "Administrator"
-        self.password = "password"
+        self.password = "asdasd"
         self.bucket_name = "video-analytics"
         self._cluster = None
         self._collection = None
